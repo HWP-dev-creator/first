@@ -1,0 +1,651 @@
+"""
+电商知识库RAG系统 - v2修复版
+修复：拒答逻辑、检索质量、幻觉控制
+"""
+
+from openai import OpenAI
+import chromadb
+import numpy as np
+import re
+import json
+import time
+from typing import List, Dict
+
+# ========== 配置 ==========
+API_KEY = "api"
+BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+
+CHROMA_PATH = "./chroma_ecommerce_db_v2"
+COLLECTION_NAME = "ecommerce_knowledge_v2"
+
+
+# ==================== 模块1：文档加载 ====================
+def load_document(file_path: str) -> List[Dict]:
+    with open(file_path, 'r', encoding='utf-8') as f:
+        raw_text = f.read()
+    
+    raw_text = raw_text.replace('\r\n', '\n')
+    lines = [line for line in raw_text.split('\n') if line.strip() or line == '']
+    
+    patterns = {
+        1: re.compile(r'^[一二三四五六七八九十]+、\s*\S+'),
+        2: re.compile(r'^\d+\.\d+\s+\S+'),
+        3: re.compile(r'^（\d+）\s*\S+|^\d+\.\s+\S+'),
+    }
+    
+    sections = []
+    current_level1 = None
+    current_level2 = None
+    current_content = []
+    
+    def save_current_section():
+        nonlocal current_level2, current_level1, current_content, sections
+        if current_level2 and current_content:
+            sections.append({
+                "title": current_level2["title"],
+                "parent": current_level1["title"] if current_level1 else "",
+                "content": '\n'.join(current_content).strip(),
+                "level": 2
+            })
+            current_content = []
+    
+    for line in lines:
+        line_stripped = line.strip()
+        if not line_stripped:
+            if current_content and current_content[-1] != '':
+                current_content.append('')
+            continue
+        
+        if patterns[1].match(line_stripped):
+            save_current_section()
+            current_level1 = {"title": line_stripped, "level": 1}
+            current_level2 = None
+            continue
+        
+        if patterns[2].match(line_stripped):
+            save_current_section()
+            current_level2 = {"title": line_stripped, "level": 2}
+            continue
+        
+        if patterns[3].match(line_stripped):
+            current_content.append(f"**{line_stripped}**")
+            continue
+        
+        current_content.append(line_stripped)
+    
+    save_current_section()
+    print(f"✅ 文档加载完成：{len(sections)} 个章节")
+    return sections
+
+
+# ==================== 模块2：文本分块 ====================
+def chunk_all_sections(sections: List[Dict], max_chunk_size: int = 400, overlap: int = 50) -> List[Dict]:
+    all_chunks = []
+    for sec in sections:
+        chunks = _chunk_section(sec, max_chunk_size, overlap)
+        all_chunks.extend(chunks)
+    print(f"✅ 分块完成：{len(sections)} 个章节 → {len(all_chunks)} 个文本块")
+    return all_chunks
+
+
+def _chunk_section(section: Dict, max_chunk_size: int, overlap: int) -> List[Dict]:
+    title = section["title"]
+    parent = section["parent"]
+    content = section["content"]
+    
+    if len(content) <= max_chunk_size:
+        return [{
+            "id": f"{title}_chunk_0",
+            "title": title,
+            "parent": parent,
+            "content": content,
+            "level": section["level"],
+            "chunk_index": 0
+        }]
+    
+    paragraphs = [p.strip() for p in content.split('\n\n') if p.strip()]
+    chunks = []
+    current_chunk = []
+    current_length = 0
+    chunk_index = 0
+    
+    def save_chunk():
+        nonlocal current_chunk, current_length, chunk_index
+        if not current_chunk:
+            return
+        chunk_text = '\n'.join(current_chunk)
+        chunks.append({
+            "id": f"{title}_chunk_{chunk_index}",
+            "title": title,
+            "parent": parent,
+            "content": chunk_text,
+            "level": section["level"],
+            "chunk_index": chunk_index
+        })
+        chunk_index += 1
+        overlap_text = chunk_text[-overlap:] if len(chunk_text) > overlap else chunk_text
+        current_chunk = [overlap_text] if overlap_text else []
+        current_length = len(overlap_text)
+    
+    for para in paragraphs:
+        para_len = len(para)
+        if para_len > max_chunk_size:
+            if current_chunk:
+                save_chunk()
+            sentences = re.split(r'([。！？；\n])', para)
+            sentences = [''.join(sentences[i:i+2]) for i in range(0, len(sentences)-1, 2)]
+            temp_chunk = []
+            temp_length = 0
+            for sent in sentences:
+                if temp_length + len(sent) > max_chunk_size and temp_chunk:
+                    chunk_text = ''.join(temp_chunk)
+                    chunks.append({
+                        "id": f"{title}_chunk_{chunk_index}",
+                        "title": title,
+                        "parent": parent,
+                        "content": chunk_text,
+                        "level": section["level"],
+                        "chunk_index": chunk_index
+                    })
+                    chunk_index += 1
+                    overlap_text = chunk_text[-overlap:] if len(chunk_text) > overlap else chunk_text
+                    temp_chunk = [overlap_text, sent] if overlap_text else [sent]
+                    temp_length = sum(len(s) for s in temp_chunk)
+                else:
+                    temp_chunk.append(sent)
+                    temp_length += len(sent)
+            if temp_chunk:
+                chunk_text = ''.join(temp_chunk)
+                chunks.append({
+                    "id": f"{title}_chunk_{chunk_index}",
+                    "title": title,
+                    "parent": parent,
+                    "content": chunk_text,
+                    "level": section["level"],
+                    "chunk_index": chunk_index
+                })
+                chunk_index += 1
+            current_chunk = []
+            current_length = 0
+            continue
+        
+        if current_length + para_len + 1 > max_chunk_size and current_chunk:
+            save_chunk()
+        current_chunk.append(para)
+        current_length += para_len + 1
+    
+    if current_chunk:
+        chunk_text = '\n'.join(current_chunk)
+        chunks.append({
+            "id": f"{title}_chunk_{chunk_index}",
+            "title": title,
+            "parent": parent,
+            "content": chunk_text,
+            "level": section["level"],
+            "chunk_index": chunk_index
+        })
+    return chunks
+
+
+# ==================== 模块3：向量化与存储 ====================
+def get_embedding(text: str) -> List[float]:
+    response = client.embeddings.create(
+        model="text-embedding-v3",
+        input=text,
+        encoding_format="float"
+    )
+    return response.data[0].embedding
+
+
+class VectorStore:
+    def __init__(self, collection_name: str = COLLECTION_NAME):
+        self.client = chromadb.PersistentClient(path=CHROMA_PATH)
+        self.collection = self.client.get_or_create_collection(
+            name=collection_name,
+            metadata={"hnsw:space": "cosine"}
+        )
+    
+    def add_chunks(self, chunks: List[Dict]):
+        documents = []
+        metadatas = []
+        ids = []
+        print(f"🔄 正在向量化 {len(chunks)} 个文本块...")
+        for i, chunk in enumerate(chunks):
+            documents.append(chunk["content"])
+            metadatas.append({
+                "title": chunk["title"],
+                "parent": chunk["parent"],
+                "level": str(chunk["level"]),
+                "chunk_index": str(chunk["chunk_index"]),
+                "id": chunk["id"]
+            })
+            ids.append(chunk["id"])
+            if (i + 1) % 5 == 0 or i == len(chunks) - 1:
+                print(f"   进度：{i+1}/{len(chunks)}")
+        self.collection.add(documents=documents, metadatas=metadatas, ids=ids)
+        print(f"✅ 已添加 {len(chunks)} 个向量")
+    
+    def search(self, query: str, top_k: int = 5) -> List[Dict]:
+        results = self.collection.query(query_texts=[query], n_results=top_k)
+        hits = []
+        if results['ids'][0]:
+            for i in range(len(results['ids'][0])):
+                hits.append({
+                    "id": results['ids'][0][i],
+                    "content": results['documents'][0][i],
+                    "metadata": results['metadatas'][0][i],
+                    "distance": results['distances'][0][i],
+                    "similarity": 1 - results['distances'][0][i]
+                })
+        return hits
+    
+    def keyword_search(self, query: str, top_k: int = 5) -> List[Dict]:
+        all_data = self.collection.get()
+        if not all_data['ids']:
+            return []
+        query_words = set(re.findall(r'\w+', query.lower()))
+        scored = []
+        for i, doc in enumerate(all_data['documents']):
+            doc_words = set(re.findall(r'\w+', doc.lower()))
+            common = query_words & doc_words
+            if common:
+                score = len(common) / len(query_words)
+                scored.append({
+                    "id": all_data['ids'][i],
+                    "content": doc,
+                    "metadata": all_data['metadatas'][i],
+                    "score": score,
+                    "similarity": score
+                })
+        scored.sort(key=lambda x: x['score'], reverse=True)
+        return scored[:top_k]
+    
+    def count(self) -> int:
+        return self.collection.count()
+    
+    def clear(self):
+        try:
+            self.client.delete_collection(COLLECTION_NAME)
+        except:
+            pass
+        self.collection = self.client.get_or_create_collection(
+            name=COLLECTION_NAME,
+            metadata={"hnsw:space": "cosine"}
+        )
+    
+    def get_all_content(self) -> str:
+        """获取所有文档内容，用于关键词过滤"""
+        all_data = self.collection.get()
+        if not all_data['ids']:
+            return ""
+        return " ".join(all_data['documents'])
+
+
+# ==================== 模块4：检索（多路召回）====================
+class Retriever:
+    def __init__(self, vector_store: VectorStore):
+        self.store = vector_store
+    
+    def rewrite_query(self, query: str) -> List[str]:
+        """简化改写策略：对简单问题减少改写"""
+        # 如果是简单事实性问题（含"多少""是什么""有哪些"），不改写
+        simple_patterns = [r'多少', r'是什么', r'有哪些', r'分为哪', r'什么是']
+        if any(re.search(p, query) for p in simple_patterns):
+            return [query]
+        
+        prompt = f"""请把以下问题改写成2个不同版本的检索查询，用于搜索知识库。
+保留原意，使用同义词替换。直接输出2个问题，每行一个，不要编号。
+
+原问题：{query}"""
+        
+        response = client.chat.completions.create(
+            model="qwen-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.5,
+            max_tokens=150
+        )
+        
+        rewritten = response.choices[0].message.content.strip().split('\n')
+        rewritten = [q.strip() for q in rewritten if q.strip()]
+        return [query] + rewritten[:2]
+    
+    def retrieve(self, query: str, top_k: int = 5) -> List[Dict]:
+        """多路召回"""
+        queries = self.rewrite_query(query)
+        print(f"🔍 查询：{queries}")
+        
+        # 向量检索
+        all_vector_hits = []
+        for q in queries:
+            hits = self.store.search(q, top_k=3)
+            all_vector_hits.extend(hits)
+        
+        # 关键词检索
+        keyword_hits = self.store.keyword_search(query, top_k=3)
+        
+        # 合并去重
+        seen_ids = set()
+        merged = []
+        
+        for hit in sorted(all_vector_hits, key=lambda x: x['similarity'], reverse=True):
+            if hit['id'] not in seen_ids:
+                merged.append(hit)
+                seen_ids.add(hit['id'])
+        
+        for hit in keyword_hits:
+            if hit['id'] not in seen_ids:
+                merged.append(hit)
+                seen_ids.add(hit['id'])
+        
+        return merged[:top_k]
+
+
+# ==================== 模块5：重排序 ====================
+class Reranker:
+    def rerank(self, query: str, documents: List[Dict], top_n: int = 3) -> List[Dict]:
+        if not documents:
+            return []
+        
+        doc_texts = "\n\n".join([
+            f"文档{i+1}：{doc['content'][:200]}"
+            for i, doc in enumerate(documents)
+        ])
+        
+        prompt = f"""判断以下文档与用户问题的相关程度，按相关性打分（0-10分）。
+只输出分数，格式：文档1:8,文档2:3,文档3:5
+
+用户问题：{query}
+
+{doc_texts}"""
+        
+        response = client.chat.completions.create(
+            model="qwen-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=100
+        )
+        
+        scores_text = response.choices[0].message.content
+        print(f"📊 重排序：{scores_text}")
+        
+        for i, doc in enumerate(documents):
+            match = re.search(rf'文档{i+1}[:：]\s*(\d+)', scores_text)
+            if match:
+                doc['rerank_score'] = int(match.group(1)) / 10
+            else:
+                doc['rerank_score'] = doc.get('similarity', 0)
+        
+        documents.sort(key=lambda x: x['rerank_score'], reverse=True)
+        return documents[:top_n]
+
+
+# ==================== 模块6：拒答判断（修复版）====================
+class AnswerChecker:
+    def __init__(self, vector_store: VectorStore):
+        self.store = vector_store
+    
+    def _has_keywords_in_docs(self, query: str) -> bool:
+        """检查查询中的核心关键词是否出现在文档中"""
+        all_content = self.store.get_all_content().lower()
+        # 提取查询中的名词性关键词（2字以上）
+        keywords = re.findall(r'[\u4e00-\u9fa5]{2,}', query)
+        # 至少有一个关键词在文档中
+        return any(kw in all_content for kw in keywords)
+    
+    def check(self, question: str, documents: List[Dict]) -> tuple:
+        """判断是否能回答 - 硬拦截版"""
+        
+        # 快速过滤：如果文档中没有查询的核心词，直接拒答
+        if not self._has_keywords_in_docs(question):
+            print(f"   关键词过滤：文档中无相关关键词")
+            return False, "不能（关键词缺失）"
+        
+        # 如果检索到的文档相关性都很低，直接拒答
+        if not documents or documents[0].get('rerank_score', 0) < 0.3:
+            print(f"   相关性过滤：最高相关度 {documents[0].get('rerank_score', 0):.3f} < 0.3")
+            return False, "不能（相关性不足）"
+        
+        # 大模型判断
+        context = "\n".join([d['content'][:300] for d in documents[:2]])
+        
+        prompt = f"""请严格判断：根据以下参考资料，是否能准确、完整地回答用户问题？
+注意：
+- 如果资料中只有部分相关信息，但不足以完整回答，输出"不能"
+- 如果资料中没有直接相关的数据或事实，输出"不能"
+- 只有资料能直接推导出答案时，才输出"可以"
+
+参考资料：
+{context}
+
+用户问题：{question}
+
+判断结果（只能输出"可以"或"不能"）："""
+        
+        response = client.chat.completions.create(
+            model="qwen-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=10
+        )
+        
+        result = response.choices[0].message.content.strip()
+        is_answerable = result == "可以"
+        
+        return is_answerable, result
+
+
+# ==================== 模块7：答案生成 ====================
+class AnswerGenerator:
+    def generate(self, question: str, documents: List[Dict]) -> Dict:
+        context = "\n\n".join([
+            f"[来源{i+1}] {doc['content']}"
+            for i, doc in enumerate(documents)
+        ])
+        
+        prompt = f"""你是电商领域知识库助手，只基于提供的资料回答问题。
+
+参考资料：
+{context}
+
+用户问题：{question}
+
+要求：
+1. 准确、详细、有条理
+2. 涉及数据必须引用来源编号
+3. 如果资料中有多个角度，请分点说明
+4. 末尾列出引用的来源编号
+5. 严禁编造资料中没有的信息
+
+请回答："""
+        
+        response = client.chat.completions.create(
+            model="qwen-turbo",
+            messages=[
+                {"role": "system", "content": "你是严谨的电商知识库助手，只基于资料回答，不编造信息。"},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.2,
+            max_tokens=1500
+        )
+        
+        answer = response.choices[0].message.content
+        
+        return {
+            "answer": answer,
+            "sources": [
+                {
+                    "title": doc['metadata']['title'],
+                    "parent": doc['metadata']['parent'],
+                    "score": doc.get('rerank_score', doc.get('similarity', 0))
+                }
+                for doc in documents
+            ]
+        }
+
+
+# ==================== 整合：RAG系统（修复版）====================
+class EcommerceRAG:
+    def __init__(self):
+        self.store = VectorStore()
+        self.retriever = Retriever(self.store)
+        self.reranker = Reranker()
+        self.checker = AnswerChecker(self.store)
+        self.generator = AnswerGenerator()
+    
+    def build_knowledge_base(self, file_path: str, force_rebuild: bool = False):
+        if self.store.count() > 0 and not force_rebuild:
+            print(f"⚡ 知识库已有 {self.store.count()} 条数据，跳过构建")
+            return
+        
+        if force_rebuild:
+            self.store.clear()
+        
+        sections = load_document(file_path)
+        chunks = chunk_all_sections(sections, max_chunk_size=400, overlap=50)
+        self.store.add_chunks(chunks)
+        print(f"🎉 知识库构建完成！共 {self.store.count()} 个知识块")
+    
+    def query(self, question: str) -> Dict:
+        print(f"\n{'='*60}")
+        print(f"❓ 问题：{question}")
+        print("-" * 60)
+        
+        # 1. 检索
+        print("🔍 步骤1：多路召回...")
+        retrieved = self.retriever.retrieve(question, top_k=5)
+        print(f"   召回 {len(retrieved)} 条候选")
+        
+        # 2. 重排序
+        print("📊 步骤2：重排序...")
+        ranked = self.reranker.rerank(question, retrieved, top_n=3)
+        
+        # 3. 拒答检查（硬拦截）
+        print("🛡️ 步骤3：拒答检查...")
+        is_answerable, check_result = self.checker.check(question, ranked)
+        print(f"   判断结果：{check_result}")
+        
+        if not is_answerable:
+            return {
+                "question": question,
+                "answer": "根据现有资料，无法找到足够的信息来回答这个问题。文档主要涵盖电商平台用户运营、流失预测、会员体系、大促策略、客服售后、数据安全等内容。",
+                "sources": [],
+                "answerable": False
+            }
+        
+        # 4. 生成答案
+        print("💡 步骤4：生成答案...")
+        result = self.generator.generate(question, ranked)
+        result["question"] = question
+        result["answerable"] = True
+        
+        return result
+    
+    def batch_test(self, test_cases: List[Dict]):
+        print(f"\n{'='*60}")
+        print("【批量测试开始】")
+        print(f"{'='*60}")
+        
+        correct = 0
+        total = len(test_cases)
+        
+        for case in test_cases:
+            result = self.query(case["question"])
+            
+            if case.get("should_answer", True):
+                if result["answerable"]:
+                    if all(kw in result["answer"] for kw in case.get("keywords", [])):
+                        status = "✅ 正确"
+                        correct += 1
+                    else:
+                        status = "⚠️ 答案不完整"
+                else:
+                    status = "❌ 误拒答"
+            else:
+                if not result["answerable"]:
+                    status = "✅ 正确拒答"
+                    correct += 1
+                else:
+                    status = "❌ 幻觉！不应回答"
+            
+            print(f"\n{status}")
+            print(f"期望：{case.get('expected', '拒答')}")
+            print(f"实际：{result['answer'][:150]}...")
+            print("-" * 40)
+        
+        print(f"\n📊 测试结果：{correct}/{total} 正确，准确率 {correct/total*100:.1f}%")
+
+
+# ==================== 主流程 ====================
+if __name__ == "__main__":
+    rag = EcommerceRAG()
+    
+    # 构建知识库（第一次运行）
+    rag.build_knowledge_base("ecommerce_knowledge.txt", force_rebuild=True)
+    
+    # 单条测试
+    print("\n" + "="*60)
+    print("【单条测试】")
+    print("="*60)
+    
+    single_tests = [
+        "用户生命周期分为哪几个阶段？",
+        "XGBoost流失预测模型的AUC是多少？",
+        "黑卡会员享受什么折扣？",
+        "服饰类平均退货率是多少？",
+    ]
+    
+    for q in single_tests:
+        result = rag.query(q)
+        print(f"\n💡 回答：\n{result['answer']}")
+        if result['sources']:
+            print(f"\n📚 来源：")
+            for s in result['sources']:
+                print(f"   - {s['parent']} / {s['title']} (相关度：{s['score']:.3f})")
+        print("="*60)
+    
+    # 批量测试（含陷阱题）
+    print("\n" + "="*60)
+    print("【批量测试（含陷阱题）】")
+    print("="*60)
+    
+    batch_cases = [
+        {
+            "question": "成熟期用户贡献平台多少GMV？",
+            "keywords": ["60%"],
+            "expected": "约60%"
+        },
+        {
+            "question": "100积分等于多少元抵扣券？",
+            "keywords": ["1元"],
+            "expected": "1元"
+        },
+        {
+            "question": "如果一个用户连续100天未登录，属于什么流失类型？",
+            "keywords": ["轻度流失"],
+            "expected": "轻度流失"
+        },
+        {
+            "question": "大促前4小时GMV占比多少？",
+            "keywords": ["50%"],
+            "expected": "50%"
+        },
+        {
+            "question": "抖音电商的ROI标准是多少？",
+            "should_answer": False,
+            "expected": "拒答"
+        },
+        {
+            "question": "什么是区块链电商？",
+            "should_answer": False,
+            "expected": "拒答"
+        },
+        {
+            "question": "2026年电商趋势是什么？",
+            "should_answer": False,
+            "expected": "拒答"
+        }
+    ]
+    
+    rag.batch_test(batch_cases)
